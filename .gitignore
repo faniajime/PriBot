@@ -1,0 +1,58 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# =========================
+# Environment variables
+# =========================
+.env
+
+# =========================
+# Databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# IDEs / Editors
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# GPT4All / AI models
+# =========================
+.cache/
+.gpt4all/
+**/*.gguf
+
+# GPT4All default cache location (mac/linux)
+~/.cache/gpt4all/
+
+# =========================
+# Docker (if added later)
+# =========================
+*.env.docker

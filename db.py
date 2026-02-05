@@ -139,19 +139,44 @@ def insert_note(text: str) -> int:
         return cur.lastrowid
 
 def search_notes(query: str, limit: int = 5):
-    # búsqueda simple por LIKE (después lo hacemos mejor)
-    terms = [t for t in query.lower().split() if len(t) >= 3]
+    """
+    Búsqueda mejorada:
+    - quita stopwords comunes (como/qué/cuál/etc.)
+    - usa OR en vez de AND
+    - ordena por "cantidad de matches" (ranking simple)
+    """
+    stopwords = {
+        "como", "cómo", "que", "qué", "cual", "cuál", "quien", "quién",
+        "se", "llama", "es", "la", "el", "los", "las", "un", "una",
+        "de", "del", "al", "a", "mi", "mis", "tu", "tus", "su", "sus",
+        "por", "para", "sobre", "esto", "eso"
+    }
+
+    # tokens limpios
+    raw_terms = [t.strip("¿?¡!.,:;()\"'").lower() for t in query.split()]
+    terms = [t for t in raw_terms if len(t) >= 3 and t not in stopwords]
     if not terms:
         return []
 
-    where = " AND ".join(["LOWER(text) LIKE ?"] * len(terms))
+    like_clauses = ["LOWER(text) LIKE ?"] * len(terms)
+    where_or = " OR ".join(like_clauses)
     params = [f"%{t}%" for t in terms]
+
+    # ranking: suma 1 por cada término que matchee
+    score_expr = " + ".join([f"(CASE WHEN LOWER(text) LIKE ? THEN 1 ELSE 0 END)" for _ in terms])
+    score_params = [f"%{t}%" for t in terms]
+
+    sql = f"""
+        SELECT id, text, created_at_utc,
+               ({score_expr}) AS score
+        FROM notes
+        WHERE ({where_or})
+        ORDER BY score DESC, id DESC
+        LIMIT ?
+    """
 
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            f"SELECT id, text, created_at_utc FROM notes WHERE {where} ORDER BY id DESC LIMIT ?",
-            (*params, limit)
-        )
+        cur.execute(sql, (*score_params, *params, limit))
         rows = cur.fetchall()
         return [{"id": r[0], "text": r[1], "created_at_utc": r[2]} for r in rows]

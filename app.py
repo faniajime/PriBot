@@ -1,5 +1,6 @@
 import os
 import requests
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request
@@ -68,38 +69,56 @@ def get_text_message_fields(msg: Dict[str, Any]) -> Tuple[Optional[str], str]:
 # AI normalization
 # ==================================================
 def normalize_ai_routing(routed: Dict[str, Any]) -> Dict[str, Any]:
-    if not routed:
+    if not routed or not isinstance(routed, dict):
         return {"intent": "unknown"}
 
-    # corregir reminder\_text
-    if "reminder_text" not in routed and "reminder\\_text" in routed:
-        routed["reminder_text"] = routed.get("reminder\\_text")
+    # 1) Fix reminder_text key variants
+    if "reminder_text" not in routed:
+        if "reminder\\_text" in routed:
+            routed["reminder_text"] = routed.get("reminder\\_text")
+        elif "reminder_text " in routed:
+            routed["reminder_text"] = routed.get("reminder_text ")
 
-    # ✅ NORMALIZAR INTENTS (sinónimos del modelo)
+    # 2) Normalize intent synonyms from GPT4All/Mistral
     intent = (routed.get("intent") or "").strip().lower()
 
-    if intent in ("memory_store", "store_memory", "note", "remember"):
-        routed["intent"] = "memory_store"
-
+    # memory
+    if intent in ("memory_store", "store_memory", "note", "remember", "memory_save"):
+        intent = "memory_store"
     if intent in ("memory_query", "memory_get", "query_memory", "ask_memory", "memory_lookup"):
-        routed["intent"] = "memory_get"
+        intent = "memory_get"
 
-    if intent in ("remind", "reminder_create"):
-        routed["intent"] = "reminder"
+    # reminder
+    if intent in ("remind", "reminder_create", "create_reminder"):
+        intent = "reminder"
 
-    # normalizar tiempo relativo
+    # canonical intents for your app
+    if intent not in ("reminder", "memory_set", "memory_store", "memory_get"):
+        intent = "unknown"
+
+    routed["intent"] = intent
+
+    # 3) Normalize relative time string: "30 segundos" -> "en 30 segundos"
     when = (routed.get("when") or "").strip()
     if when and not when.lower().startswith("en "):
-        routed["when"] = f"en {when}"
+        if re.search(r"^\d+\s+(segundo|segundos|minuto|minutos|hora|horas)$", when.lower()):
+            routed["when"] = f"en {when}"
 
-    # a veces el modelo usa "text" en vez de "key" para queries
-    if routed.get("intent") == "memory_get":
-        if not routed.get("key") and routed.get("text"):
-            routed["key"] = routed.get("text")
+    # 4) IMPORTANT: do NOT set key to the whole question.
+    # Use "query" for memory_get if model returns "text"
+    if routed["intent"] == "memory_get":
+        if not routed.get("query"):
+            if routed.get("text"):
+                routed["query"] = routed.get("text")
+            elif routed.get("key"):
+                routed["query"] = routed.get("key")
 
     return routed
 
 
+# ==================================================
+# AI action router
+# ==================================================
 def handle_ai_intents(from_number: str, text_body: str) -> bool:
     routed = normalize_ai_routing(ai_route(text_body))
     print("🧭 AI routed:", routed)
@@ -123,50 +142,54 @@ def handle_ai_intents(from_number: str, text_body: str) -> bool:
         return True
 
     # =======================
-    # MEMORIA
+    # MEMORIA (facts key/value)
     # =======================
     if intent == "memory_set":
         key = (routed.get("key") or "").strip()
         value = (routed.get("value") or "").strip()
 
         if key and value:
-            store_memory(key, value)
-            send_whatsapp_text(
-                from_number,
-                f"🧠 Listo, voy a recordar:\n{key} = {value}",
-            )
+            store_memory(key=key, value=value)  # facts
+            send_whatsapp_text(from_number, f"🧠 Listo. Recordaré:\n{key} = {value}")
             return True
-        
+
+        return False
+
+    # =======================
+    # MEMORIA (notes free-form)
+    # =======================
     if intent == "memory_store":
         note = (routed.get("text") or "").strip()
         if note:
-            # Guardar nota completa (memoria amplia)
-            store_memory(note)  # <- ver nota abajo
+            store_memory(note=note)  # notes
             send_whatsapp_text(from_number, f"🧠 Anotado: {note}")
             return True
         return False
 
+    # =======================
+    # MEMORIA (query)
+    # =======================
     if intent == "memory_get":
-        key = (routed.get("key") or "").strip()
-        if not key:
-            key = (routed.get("text") or "").strip()
-
-        if key:
-            answer = query_memory(key)
+        q = (routed.get("query") or "").strip()
+        if q:
+            answer = query_memory(q)
             send_whatsapp_text(from_number, answer)
             return True
-
+        return False
 
     return False
 
 
 def handle_default(from_number: str, text_body: str) -> None:
-    low = text_body.lower()
+    low = text_body.lower().strip()
     if low in ("hola", "hi", "hello"):
         send_whatsapp_text(
             from_number,
             "¡Hola! 🤖 Soy PriBot.\n"
-            "Puedo guardar recuerdos y crear recordatorios."
+            "Decime algo como:\n"
+            "• 'Recuérdame tomar agua en 10 minutos'\n"
+            "• 'Recuerda que la abuela de memen se llama Ocha'\n"
+            "• 'Cómo se llama la abuela de memen?'"
         )
     else:
         send_whatsapp_text(from_number, f"Te leí: “{text_body}” ✅")
@@ -202,7 +225,7 @@ def receive_webhook():
         if extract_statuses(value):
             return "OK", 200
 
-        # 1) Mensajes
+        # 1) Incoming messages
         for msg in extract_messages(value):
             from_number, text_body = get_text_message_fields(msg)
             if not from_number or not text_body:
@@ -210,19 +233,18 @@ def receive_webhook():
 
             print("📨 Incoming:", from_number, text_body)
 
-            # 1) atajo: listar recordatorios (sin IA)
+            # Atajo: listar recordatorios sin IA
             if text_body.lower().strip() == "mis recordatorios":
                 _, reply = list_user_reminders(from_number)
                 send_whatsapp_text(from_number, reply)
                 continue
 
-            # 2) IA decide intent y ejecuta
+            # IA decide intent y ejecuta
             if handle_ai_intents(from_number, text_body):
                 continue
 
-            # 3) fallback
+            # Fallback
             handle_default(from_number, text_body)
-
 
     except Exception as e:
         print("Webhook error:", e)

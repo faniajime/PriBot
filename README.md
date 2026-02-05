@@ -63,6 +63,7 @@ PriBot/
 ├── .gitignore
 ├── README.md
 └── requirements.txt
+```
 
 ## ⚙️ Requisitos
 
@@ -80,6 +81,7 @@ cd PriBot
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
 ## 🔐 Variables de entorno
 Crear un archivo .env (NO se sube al repo):
@@ -88,11 +90,13 @@ Crear un archivo .env (NO se sube al repo):
 VERIFY_TOKEN=pribot_verify_123
 WHATSAPP_TOKEN=xxxxxxxx
 PHONE_NUMBER_ID=xxxxxxxx
+```
 
 ## Ejecutar en local
 
 ```bash
 python app.py
+```
 
 ## 💬 Comandos soportados
 
@@ -100,17 +104,20 @@ Recordatorios
 ```text
 recordar tomar agua en 30 segundos
 mis recordatorios
+```
 
 Memoria
 ```text
 recuerda perro = Luna
 dato perro
+```
 
 Lenguaje natural con IA
 ```text
 Acuérdame tomar agua en 30 segundos
 Guardá que mi perro se llama Luna
 Cómo se llama mi perro?
+```
 
 ## 📌 Estado del proyecto
 ✅ MVP funcional

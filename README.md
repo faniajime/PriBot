@@ -121,7 +121,9 @@ Cómo se llama mi perro?
 ```
 
 ## 📌 Estado del proyecto
+
 ✅ MVP funcional
+
 🚧 Mejoras futuras:
 - Borrar recordatorios
 - Recordatorios recurrentes

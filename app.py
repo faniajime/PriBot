@@ -1,5 +1,7 @@
 import os
 import requests
+from typing import Any, Dict, List, Optional, Tuple
+
 from flask import Flask, request
 from dotenv import load_dotenv
 
@@ -19,7 +21,10 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 
-def send_whatsapp_text(to: str, text: str):
+# =========================
+# WhatsApp sender
+# =========================
+def send_whatsapp_text(to: str, text: str) -> int:
     url = f"https://graph.facebook.com/v24.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -37,6 +42,128 @@ def send_whatsapp_text(to: str, text: str):
     return r.status_code
 
 
+# =========================
+# Webhook parsing helpers
+# =========================
+def extract_value(data: Dict[str, Any]) -> Dict[str, Any]:
+    entry = (data.get("entry") or [None])[0] or {}
+    change = (entry.get("changes") or [None])[0] or {}
+    value = change.get("value") or {}
+    return value
+
+
+def extract_messages(value: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return value.get("messages") or []
+
+
+def extract_statuses(value: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return value.get("statuses") or []
+
+
+def get_text_message_fields(msg: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    from_number = msg.get("from")
+    text_body = (msg.get("text") or {}).get("body", "")
+    text_body = (text_body or "").strip()
+    return from_number, text_body
+
+
+# =========================
+# AI normalization
+# =========================
+def normalize_ai_routing(routed: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Corrige outputs típicos de GPT4All/Mistral:
+    - key "reminder\\_text" en vez de "reminder_text"
+    - when: "30 segundos" -> "en 30 segundos"
+    """
+    if not routed:
+        return {"intent": "unknown"}
+
+    # Normalizar reminder_text
+    if "reminder_text" not in routed and "reminder\\_text" in routed:
+        routed["reminder_text"] = routed.get("reminder\\_text")
+
+    # Normalizar when
+    when = (routed.get("when") or "").strip()
+    if when and not when.lower().startswith("en "):
+        # si parece duración (seg/min/hora), agregamos "en "
+        # ej: "30 segundos" -> "en 30 segundos"
+        routed["when"] = f"en {when}"
+
+    return routed
+
+
+# =========================
+# Message handlers
+# =========================
+def handle_reminders(from_number: str, text_body: str) -> bool:
+    handled, reply = handle_reminders_commands(
+        from_number,
+        text_body,
+        send_fn=lambda m: send_whatsapp_text(from_number, m),
+    )
+    if handled:
+        send_whatsapp_text(from_number, reply)
+    return handled
+
+
+def handle_memory(from_number: str, text_body: str) -> bool:
+    handled, reply = handle_memory_commands(from_number, text_body)
+    if handled:
+        send_whatsapp_text(from_number, reply)
+    return handled
+
+
+def handle_ai_intents(from_number: str, text_body: str) -> bool:
+    routed = ai_route(text_body)
+    routed = normalize_ai_routing(routed)
+
+    print("🧭 AI routed:", routed)
+
+    intent = (routed.get("intent") or "").strip()
+
+    if intent == "reminder":
+        reminder_text = (routed.get("reminder_text") or "").strip()
+        when = (routed.get("when") or "").strip()
+
+        if reminder_text and when:
+            synthetic = f"recordar {reminder_text} {when}"
+            return handle_reminders(from_number, synthetic)
+
+        return False
+
+    if intent == "memory_set":
+        key = (routed.get("key") or "").strip()
+        value_ = (routed.get("value") or "").strip()
+
+        if key and value_:
+            synthetic = f"recuerda {key} = {value_}"
+            return handle_memory(from_number, synthetic)
+
+        return False
+
+    if intent == "memory_get":
+        key = (routed.get("key") or "").strip()
+        if key:
+            synthetic = f"dato {key}"
+            return handle_memory(from_number, synthetic)
+
+        return False
+
+    return False
+
+
+def handle_default(from_number: str, text_body: str) -> None:
+    low = text_body.lower().strip()
+    if low in ("hola", "hi", "hello"):
+        send_whatsapp_text(from_number, "¡Hola! 🤖 Soy PriBot. Escribí 'ayuda' para ver comandos.")
+    else:
+        send_whatsapp_text(from_number, f"Te leí: “{text_body}” ✅")
+
+
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def health():
     return "PriBot está vivo 🤖"
@@ -59,97 +186,41 @@ def receive_webhook():
     print("📩 Webhook event:", data)
 
     try:
-        entry = (data.get("entry") or [])[0]
-        change = (entry.get("changes") or [])[0]
-        value = change.get("value") or {}
+        value = extract_value(data)
 
         # 0) Status updates (sent/delivered/read)
-        statuses = value.get("statuses") or []
+        statuses = extract_statuses(value)
         if statuses:
             s = statuses[0]
             print(f"📦 Status update: {s.get('status')} -> {s.get('recipient_id')}")
             return "OK", 200
 
         # 1) Incoming messages
-        messages = value.get("messages") or []
+        messages = extract_messages(value)
         if not messages:
             return "OK", 200
 
         # Procesar todos por si vienen en batch
         for msg in messages:
-            from_number = msg.get("from")
-            if not from_number:
+            from_number, text_body = get_text_message_fields(msg)
+            if not from_number or not text_body:
                 continue
 
-            text_body = (msg.get("text") or {}).get("body", "")
-            text_body = (text_body or "").strip()
-            if not text_body:
+            print("📨 Incoming text from", from_number, ":", text_body)
+
+            # 2) Primero: comandos directos
+            if handle_reminders(from_number, text_body):
                 continue
 
-            low = text_body.lower()
-
-            # 2) Recordatorios (por usuario)
-            handled, reply = handle_reminders_commands(
-                from_number,
-                text_body,
-                send_fn=lambda m: send_whatsapp_text(from_number, m),
-            )
-            if handled:
-                send_whatsapp_text(from_number, reply)
+            if handle_memory(from_number, text_body):
                 continue
 
-            # 3) Memoria (global)
-            handled, reply = handle_memory_commands(from_number, text_body)
-            if handled:
-                send_whatsapp_text(from_number, reply)
+            # 3) Luego: IA light (traduce a comandos)
+            if handle_ai_intents(from_number, text_body):
                 continue
 
-            # 4) IA light (solo si no matcheó comandos)
-            routed = ai_route(text_body)  # dict: intent + campos
-            intent = (routed.get("intent") or "").strip()
-
-            if intent == "reminder":
-                reminder_text = (routed.get("reminder_text") or "").strip()
-                when = (routed.get("when") or "").strip()
-
-                # Convertimos a tu comando actual
-                if reminder_text and when:
-                    synthetic = f"recordar {reminder_text} {when}"
-                    handled, reply = handle_reminders_commands(
-                        from_number,
-                        synthetic,
-                        send_fn=lambda m: send_whatsapp_text(from_number, m),
-                    )
-                    if handled:
-                        send_whatsapp_text(from_number, reply)
-                        continue
-
-            elif intent == "memory_set":
-                key = (routed.get("key") or "").strip()
-                value_ = (routed.get("value") or "").strip()
-
-                if key and value_:
-                    synthetic = f"recuerda {key} = {value_}"
-                    handled, reply = handle_memory_commands(from_number, synthetic)
-                    if handled:
-                        send_whatsapp_text(from_number, reply)
-                        continue
-
-            elif intent == "memory_get":
-                key = (routed.get("key") or "").strip()
-
-                if key:
-                    synthetic = f"dato {key}"
-                    handled, reply = handle_memory_commands(from_number, synthetic)
-                    if handled:
-                        send_whatsapp_text(from_number, reply)
-                        continue
-
-            # 5) Default
-            if low in ("hola", "hi", "hello"):
-                send_whatsapp_text(from_number, "¡Hola! 🤖 Soy PriBot. Escribí 'ayuda' para ver comandos.")
-            else:
-                send_whatsapp_text(from_number, f"Te leí: “{text_body}” ✅")
+            # 4) Default
+            handle_default(from_number, text_body)
 
     except Exception as e:
         print("Webhook parse error:", e)
@@ -157,9 +228,10 @@ def receive_webhook():
     return "OK", 200
 
 
-
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     init_db()
     start_scheduler()
     app.run(host="0.0.0.0", port=5005, debug=True, use_reloader=False)
-

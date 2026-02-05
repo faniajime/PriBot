@@ -2,120 +2,80 @@
 import json
 import re
 import ast
+import threading
 from typing import Dict
 
 from gpt4all import GPT4All
 
 MODEL_NAME = "mistral-7b-instruct-v0.1.Q4_0.gguf"
+
+# IMPORTANTE: si tenés model_path, ponelo para evitar re-descargas raras
+# model = GPT4All(MODEL_NAME, model_path="./models", allow_download=False, device="cpu")
 model = GPT4All(MODEL_NAME)
+
+_model_lock = threading.Lock()
 
 SYSTEM_PROMPT = r"""
 Sos un clasificador de intención para un bot de WhatsApp.
-Respondé SOLO un objeto JSON válido. No agregues texto extra.
+Respondé con UN SOLO objeto JSON. No agregues texto extra.
 
 Formato:
 {
-  "intent": "reminder" | "memory_store" | "memory_query" | "unknown",
+  "intent": "reminder" | "memory_set" | "memory_store" | "memory_get" | "unknown",
   "reminder_text": "",
   "when": "",
+  "key": "",
+  "value": "",
   "text": ""
 }
 
-"intent": "reminder" | "memory_store" | "memory_get" | "unknown"
-Nunca uses otros valores.
-
 Reglas:
+- reminder: "acuérdame", "recuérdame", "recordar", "recuerdame", "recuerdame"
+- memory_store: si el usuario dice "recuerda que <frase>" y NO es fácil convertir a key/value -> usá "text"
+- memory_set: si podés extraer par claro key/value (ej: "mi perro se llama Luna" -> key="perro", value="Luna")
+- memory_get: preguntas tipo "cómo se llama X", "qué es X", "quién es X"
 
-INTENT = reminder
-- El usuario quiere que le recuerden algo en el futuro
-- Palabras clave: recuerda, recuérdame, acuérdame, recordar
-Ej:
-Usuario: "Recuérdame ir a la plaza en 30 segundos"
-JSON: {
-  "intent":"reminder",
-  "reminder_text":"ir a la plaza",
-  "when":"30 segundos",
-  "text":""
-}
+Ejemplos:
+Usuario: "Recuerda que la abuela de memen se llama Ocha"
+JSON: {"intent":"memory_store","text":"la abuela de memen se llama Ocha","key":"","value":"","reminder_text":"","when":""}
 
-INTENT = memory_store
-- El usuario está afirmando información para guardar
-- Ejemplos:
-  - "Recuerda que la abuela de memen se llama Ocha"
-  - "Mi perro se llama Luna"
-  - "James es profesor de biología"
-JSON:
-{
-  "intent":"memory_store",
-  "text":"la abuela de memen se llama Ocha",
-  "reminder_text":"",
-  "when":""
-}
+Usuario: "Mi perro se llama Luna"
+JSON: {"intent":"memory_set","key":"perro","value":"Luna","text":"","reminder_text":"","when":""}
 
-INTENT = memory_query
-- El usuario está preguntando algo que podría estar en memoria
-- Ejemplos:
-  - "¿Cómo se llama la abuela de memen?"
-  - "¿A qué se dedica James?"
-JSON:
-{
-  "intent":"memory_query",
-  "text":"como se llama la abuela de memen",
-  "reminder_text":"",
-  "when":""
-}
+Usuario: "Cómo se llama la abuela de memen?"
+JSON: {"intent":"memory_get","text":"como se llama la abuela de memen","key":"","value":"","reminder_text":"","when":""}
 
-INTENT = unknown
-- Si no estás seguro
-
-Respondé siempre JSON válido.
+Usuario: "Recuérdame ir a comer con Pri en 30 seg"
+JSON: {"intent":"reminder","reminder_text":"ir a comer con Pri","when":"30 seg","key":"","value":"","text":""}
 """
 
 def _extract_object_block(text: str) -> str:
-    # agarra el primer {...} grande que encuentre
     m = re.search(r"\{.*\}", text, re.DOTALL)
     return m.group(0) if m else ""
 
 def _repair_json_string(s: str) -> str:
-    """
-    Arregla problemas típicos:
-    - saltos de línea dentro del JSON
-    - backslashes sueltos \ que rompen json.loads
-    """
-    s = s.strip()
+    s = (s or "").strip()
     s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-
-    # Si el modelo mete backslashes raros, escaparlos para que JSON no explote:
-    # Convierte \x (invalido) -> \\x (valido como string)
-    s = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
-
+    s = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", s)
     return s
 
 def safe_parse_to_dict(raw_text: str) -> Dict:
-    """
-    Nunca tira excepción. Devuelve dict con 'intent' o unknown.
-    """
     block = _extract_object_block(raw_text)
     if not block:
         return {"intent": "unknown"}
 
     block = _repair_json_string(block)
 
-    # 1) Intento JSON estricto
     try:
         data = json.loads(block)
-        if isinstance(data, dict) and "intent" in data:
+        if isinstance(data, dict):
             return data
     except Exception:
         pass
 
-    # 2) Fallback: algunos modelos devuelven "JSON" con comillas simples
-    # ast.literal_eval puede parsear dict python-style de forma segura
     try:
         data = ast.literal_eval(block)
         if isinstance(data, dict):
-            if "intent" not in data:
-                data["intent"] = "unknown"
             return data
     except Exception:
         pass
@@ -126,49 +86,56 @@ def normalize_ai_fields(data: Dict) -> Dict:
     if not isinstance(data, dict):
         return {"intent": "unknown"}
 
-    # normalizar reminder_text mal escapado
+    # arreglar reminder\_text
     if "reminder\\_text" in data and "reminder_text" not in data:
         data["reminder_text"] = data.pop("reminder\\_text")
 
-    # normalizar when
+    # normalizar intent variantes
+    intent = (data.get("intent") or "").strip().lower()
+    if intent in ("memory_query", "query_memory", "memory_lookup"):
+        intent = "memory_get"
+    if intent in ("memory_store", "store_memory", "note"):
+        intent = "memory_store"
+    if intent in ("remember", "memory_set"):
+        intent = "memory_set"
+    if intent in ("remind", "reminder_create"):
+        intent = "reminder"
+
+    if intent not in ("reminder", "memory_set", "memory_store", "memory_get"):
+        intent = "unknown"
+    data["intent"] = intent
+
+    # normalizar when relativo
     when = (data.get("when") or "").strip()
     if when and not when.lower().startswith("en "):
-        if re.search(r"\d+\s+(segundo|segundos|minuto|minutos|hora|horas)", when.lower()):
+        if re.search(r"^\d+\s*(seg|segs|segundo|segundos|min|minuto|minutos|hora|horas)$", when.lower()):
             data["when"] = f"en {when}"
 
     return data
 
-
-
 def ai_route(user_text: str) -> Dict:
-    """
-    Router IA: devuelve intención + campos.
-    """
-    try:
-        prompt = f"""{SYSTEM_PROMPT}
+    prompt = f"""{SYSTEM_PROMPT}
 
 Usuario:
 {user_text}
 
 JSON:
 """
+    # ✅ Lock: evita que 2 threads entren al modelo a la vez
+    with _model_lock:
+        try:
+            with model.chat_session():
+                response = model.generate(prompt, max_tokens=220, temp=0.0)
+        except Exception as e:
+            print("AI route error:", e)
+            return {"intent": "unknown"}
 
-        with model.chat_session():
-            response = model.generate(
-                prompt,
-                max_tokens=300,
-                temp=0.0,   # más determinista para JSON
-            )
+    response = (response or "").strip()
+    print("🧠 AI raw:", response[:800])
 
-        response = (response or "").strip()
-
-        # Debug útil (opcional): ver qué responde el modelo
-        print("🧠 AI raw:", response)
-
-        data = safe_parse_to_dict(response)
-        return normalize_ai_fields(data)
-
-
-    except Exception as e:
-        print("AI route error:", e)
+    # si viene puro <unk>, tratamos como unknown (suele indicar corrupción)
+    if "<unk>" in response and "{" not in response:
         return {"intent": "unknown"}
+
+    data = safe_parse_to_dict(response)
+    return normalize_ai_fields(data)

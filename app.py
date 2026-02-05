@@ -1,10 +1,11 @@
 import os
-import requests
-import re
-from typing import Any, Dict, List, Optional, Tuple
-
-from flask import Flask, request
 from dotenv import load_dotenv
+
+load_dotenv()  # ✅ ANTES de importar módulos que leen env vars
+
+import requests
+from typing import Any, Dict, List, Optional, Tuple
+from flask import Flask, request
 
 from memory_controller import store_memory, query_memory
 from reminders_controller import create_reminder, list_user_reminders
@@ -12,7 +13,7 @@ from scheduler import start_scheduler
 from db import init_db
 from ai_controller import ai_route
 
-load_dotenv()
+
 
 app = Flask(__name__)
 

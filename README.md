@@ -46,6 +46,7 @@ Flask API
 │ Reminders │ Memory    │
 │ Scheduler │ SQLite DB │
 └───────────┴───────────┘
+```
 
 ## 📁 Estructura del proyecto
 

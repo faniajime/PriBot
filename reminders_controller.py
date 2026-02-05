@@ -10,16 +10,23 @@ from scheduler import schedule_job
 TZ = ZoneInfo("America/Costa_Rica")
 
 
+# =========================
+# Time parsing helpers
+# =========================
+
 def parse_relative_time_fallback(text: str) -> Optional[datetime]:
     """
     Fallback manual para expresiones tipo:
     - en 1 minuto / en 5 minutos
-    - en 1 segundo / en 30 segundos
-    - en 1 hora / en 2 horas
+    - en 30 segundos
+    - en 2 horas
     """
     t = text.lower().strip()
 
-    match = re.search(r"\ben\s+(\d+)\s+(minuto|minutos|segundo|segundos|hora|horas)\b", t)
+    match = re.search(
+        r"\ben\s+(\d+)\s+(segundo|segundos|minuto|minutos|hora|horas)\b",
+        t,
+    )
     if not match:
         return None
 
@@ -40,19 +47,14 @@ def parse_relative_time_fallback(text: str) -> Optional[datetime]:
 
 def normalize_spanish_time(text: str) -> str:
     """
-    Normaliza singular en español (un minuto/una hora) para ayudar a parseo.
+    Normaliza singular en español para ayudar a dateparser.
     """
     t = text.lower()
 
     patterns = [
         (r"\ben un minuto\b", "en 1 minutos"),
-        (r"\ben una minuto\b", "en 1 minutos"),
-        (r"\ben 1 minuto\b", "en 1 minutos"),
-        (r"\ben un segundo\b", "en 1 segundos"),
-        (r"\ben 1 segundo\b", "en 1 segundos"),
         (r"\ben una hora\b", "en 1 horas"),
-        (r"\ben un hora\b", "en 1 horas"),
-        (r"\ben 1 hora\b", "en 1 horas"),
+        (r"\ben un segundo\b", "en 1 segundos"),
     ]
 
     for pattern, repl in patterns:
@@ -61,65 +63,76 @@ def normalize_spanish_time(text: str) -> str:
     return t
 
 
-def handle_reminders_commands(user_phone: str, text_body: str, send_fn) -> Tuple[bool, str]:
-    text = (text_body or "").strip()
-    low = text.lower()
+# =========================
+# Core actions
+# =========================
 
-    # LISTAR
-    if low == "mis recordatorios":
-        items = list_reminders(user_phone, limit=10)
-        if not items:
-            return True, "No tenés recordatorios. Ej: recordar pagar luz mañana 7pm"
+def create_reminder(
+    user_phone: str,
+    reminder_text: str,
+    when_text: str,
+    send_fn,
+) -> Tuple[bool, str]:
+    """
+    Crea un recordatorio.
+    La IA ya decidió intent=reminder y separó texto y tiempo.
+    """
 
-        lines = ["⏰ Tus recordatorios:"]
-        for r in items:
-            dt_utc = datetime.fromisoformat(r["remind_at_utc"]).replace(tzinfo=timezone.utc)
-            dt_local = dt_utc.astimezone(TZ)
-            lines.append(
-                f"• #{r['id']} | {dt_local.strftime('%Y-%m-%d %H:%M')} | {r['reminder_text']} ({r['status']})"
-            )
-        return True, "\n".join(lines)
+    if not reminder_text or not when_text:
+        return True, "❌ Falta información para crear el recordatorio."
 
-    # CREAR
-    if low.startswith("recordar "):
-        content = text[len("recordar "):].strip()
-        if not content:
-            return True, "Usá: recordar <tarea> <fecha/hora>\nEj: recordar pagar luz mañana 7pm"
+    settings = {
+        "PREFER_DATES_FROM": "future",
+        "TIMEZONE": "America/Costa_Rica",
+        "RETURN_AS_TIMEZONE_AWARE": True,
+    }
 
-        settings = {
-            "PREFER_DATES_FROM": "future",
-            "TIMEZONE": "America/Costa_Rica",
-            "RETURN_AS_TIMEZONE_AWARE": True,
-        }
+    normalized_when = normalize_spanish_time(when_text)
 
-        normalized = normalize_spanish_time(content)
+    # 1) dateparser
+    dt_local = dateparser.parse(
+        normalized_when,
+        settings=settings,
+        languages=["es", "en"],
+    )
 
-        # 1) Intento con dateparser
-        dt_local = dateparser.parse(normalized, settings=settings, languages=["es", "en"])
+    # 2) fallback manual
+    if not dt_local:
+        dt_local = parse_relative_time_fallback(normalized_when)
 
-        # 2) Fallback manual si dateparser falla
-        if not dt_local:
-            dt_local = parse_relative_time_fallback(normalized)
+    if not dt_local:
+        return True, "No entendí cuándo 😅\nEj: en 10 minutos, mañana a las 7pm"
 
-        if not dt_local:
-            return True, "No entendí la fecha/hora 😅\nEj: recordar tomar agua en 10 minutos"
+    # Guardar en UTC (sin tzinfo)
+    dt_utc = dt_local.astimezone(timezone.utc)
+    remind_at_utc_iso = dt_utc.replace(tzinfo=None).isoformat()
 
-        # Guardar en UTC en la DB como ISO sin tzinfo
-        dt_utc = dt_local.astimezone(timezone.utc)
-        remind_at_utc_iso = dt_utc.replace(tzinfo=None).isoformat()
+    rid = insert_reminder(user_phone, reminder_text, remind_at_utc_iso)
 
-        rid = insert_reminder(user_phone, content, remind_at_utc_iso)
+    def job():
+        send_fn(f"⏰ Recordatorio: {reminder_text}")
+        mark_reminder_sent(user_phone, rid)
 
-        def job():
-            send_fn(f"⏰ Recordatorio: {content}")
-            mark_reminder_sent(user_phone, rid)
+    schedule_job(rid, dt_utc, job)
 
-        schedule_job(rid, dt_utc, job)
+    return True, (
+        f"✅ Recordatorio guardado #{rid}\n"
+        f"🗓️ {dt_local.astimezone(TZ).strftime('%Y-%m-%d %H:%M')} (CR)\n"
+        f"📝 {reminder_text}"
+    )
 
-        return True, (
-            f"✅ Guardado #{rid}\n"
-            f"🗓️ {dt_local.astimezone(TZ).strftime('%Y-%m-%d %H:%M')} (CR)\n"
-            f"📝 {content}"
+
+def list_user_reminders(user_phone: str) -> Tuple[bool, str]:
+    items = list_reminders(user_phone, limit=10)
+    if not items:
+        return True, "No tenés recordatorios activos."
+
+    lines = ["⏰ Tus recordatorios:"]
+    for r in items:
+        dt_utc = datetime.fromisoformat(r["remind_at_utc"]).replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(TZ)
+        lines.append(
+            f"• #{r['id']} | {dt_local.strftime('%Y-%m-%d %H:%M')} | {r['reminder_text']} ({r['status']})"
         )
 
-    return False, ""
+    return True, "\n".join(lines)

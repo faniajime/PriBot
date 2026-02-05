@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 DB_PATH = "pribot.db"
 
@@ -32,6 +32,15 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'scheduled'
     );
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        created_at_utc TEXT NOT NULL
+        );
+    """)
+    
 
     conn.commit()
     conn.close()
@@ -118,3 +127,31 @@ def mark_reminder_sent(user_phone: str, reminder_id: int) -> None:
     """, (reminder_id, user_phone))
     conn.commit()
     conn.close()
+
+def insert_note(text: str) -> int:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO notes (text, created_at_utc) VALUES (?, ?)",
+            (text, datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
+        )
+        conn.commit()
+        return cur.lastrowid
+
+def search_notes(query: str, limit: int = 5):
+    # búsqueda simple por LIKE (después lo hacemos mejor)
+    terms = [t for t in query.lower().split() if len(t) >= 3]
+    if not terms:
+        return []
+
+    where = " AND ".join(["LOWER(text) LIKE ?"] * len(terms))
+    params = [f"%{t}%" for t in terms]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id, text, created_at_utc FROM notes WHERE {where} ORDER BY id DESC LIMIT ?",
+            (*params, limit)
+        )
+        rows = cur.fetchall()
+        return [{"id": r[0], "text": r[1], "created_at_utc": r[2]} for r in rows]

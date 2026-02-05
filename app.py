@@ -5,12 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request
 from dotenv import load_dotenv
 
-from memory_controller import handle_memory_commands
+from memory_controller import store_memory, query_memory
+from reminders_controller import create_reminder, list_user_reminders
 from scheduler import start_scheduler
-from reminders_controller import handle_reminders_commands
 from db import init_db
 from ai_controller import ai_route
-
 
 load_dotenv()
 
@@ -21,9 +20,9 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 
-# =========================
+# ==================================================
 # WhatsApp sender
-# =========================
+# ==================================================
 def send_whatsapp_text(to: str, text: str) -> int:
     url = f"https://graph.facebook.com/v24.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -42,14 +41,13 @@ def send_whatsapp_text(to: str, text: str) -> int:
     return r.status_code
 
 
-# =========================
+# ==================================================
 # Webhook parsing helpers
-# =========================
+# ==================================================
 def extract_value(data: Dict[str, Any]) -> Dict[str, Any]:
-    entry = (data.get("entry") or [None])[0] or {}
-    change = (entry.get("changes") or [None])[0] or {}
-    value = change.get("value") or {}
-    return value
+    entry = (data.get("entry") or [{}])[0]
+    change = (entry.get("changes") or [{}])[0]
+    return change.get("value") or {}
 
 
 def extract_messages(value: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -63,107 +61,120 @@ def extract_statuses(value: Dict[str, Any]) -> List[Dict[str, Any]]:
 def get_text_message_fields(msg: Dict[str, Any]) -> Tuple[Optional[str], str]:
     from_number = msg.get("from")
     text_body = (msg.get("text") or {}).get("body", "")
-    text_body = (text_body or "").strip()
-    return from_number, text_body
+    return from_number, (text_body or "").strip()
 
 
-# =========================
+# ==================================================
 # AI normalization
-# =========================
+# ==================================================
 def normalize_ai_routing(routed: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Corrige outputs típicos de GPT4All/Mistral:
-    - key "reminder\\_text" en vez de "reminder_text"
-    - when: "30 segundos" -> "en 30 segundos"
-    """
     if not routed:
         return {"intent": "unknown"}
 
-    # Normalizar reminder_text
+    # corregir reminder\_text
     if "reminder_text" not in routed and "reminder\\_text" in routed:
         routed["reminder_text"] = routed.get("reminder\\_text")
 
-    # Normalizar when
+    # ✅ NORMALIZAR INTENTS (sinónimos del modelo)
+    intent = (routed.get("intent") or "").strip().lower()
+
+    if intent in ("memory_store", "store_memory", "note", "remember"):
+        routed["intent"] = "memory_store"
+
+    if intent in ("memory_query", "memory_get", "query_memory", "ask_memory", "memory_lookup"):
+        routed["intent"] = "memory_get"
+
+    if intent in ("remind", "reminder_create"):
+        routed["intent"] = "reminder"
+
+    # normalizar tiempo relativo
     when = (routed.get("when") or "").strip()
     if when and not when.lower().startswith("en "):
-        # si parece duración (seg/min/hora), agregamos "en "
-        # ej: "30 segundos" -> "en 30 segundos"
         routed["when"] = f"en {when}"
+
+    # a veces el modelo usa "text" en vez de "key" para queries
+    if routed.get("intent") == "memory_get":
+        if not routed.get("key") and routed.get("text"):
+            routed["key"] = routed.get("text")
 
     return routed
 
 
-# =========================
-# Message handlers
-# =========================
-def handle_reminders(from_number: str, text_body: str) -> bool:
-    handled, reply = handle_reminders_commands(
-        from_number,
-        text_body,
-        send_fn=lambda m: send_whatsapp_text(from_number, m),
-    )
-    if handled:
-        send_whatsapp_text(from_number, reply)
-    return handled
-
-
-def handle_memory(from_number: str, text_body: str) -> bool:
-    handled, reply = handle_memory_commands(from_number, text_body)
-    if handled:
-        send_whatsapp_text(from_number, reply)
-    return handled
-
-
 def handle_ai_intents(from_number: str, text_body: str) -> bool:
-    routed = ai_route(text_body)
-    routed = normalize_ai_routing(routed)
-
+    routed = normalize_ai_routing(ai_route(text_body))
     print("🧭 AI routed:", routed)
 
-    intent = (routed.get("intent") or "").strip()
+    intent = routed.get("intent")
 
+    # =======================
+    # RECORDATORIOS
+    # =======================
     if intent == "reminder":
         reminder_text = (routed.get("reminder_text") or "").strip()
         when = (routed.get("when") or "").strip()
 
-        if reminder_text and when:
-            synthetic = f"recordar {reminder_text} {when}"
-            return handle_reminders(from_number, synthetic)
+        handled, reply = create_reminder(
+            user_phone=from_number,
+            reminder_text=reminder_text,
+            when_text=when,
+            send_fn=lambda m: send_whatsapp_text(from_number, m),
+        )
+        send_whatsapp_text(from_number, reply)
+        return True
 
-        return False
-
+    # =======================
+    # MEMORIA
+    # =======================
     if intent == "memory_set":
         key = (routed.get("key") or "").strip()
-        value_ = (routed.get("value") or "").strip()
+        value = (routed.get("value") or "").strip()
 
-        if key and value_:
-            synthetic = f"recuerda {key} = {value_}"
-            return handle_memory(from_number, synthetic)
-
+        if key and value:
+            store_memory(key, value)
+            send_whatsapp_text(
+                from_number,
+                f"🧠 Listo, voy a recordar:\n{key} = {value}",
+            )
+            return True
+        
+    if intent == "memory_store":
+        note = (routed.get("text") or "").strip()
+        if note:
+            # Guardar nota completa (memoria amplia)
+            store_memory(note)  # <- ver nota abajo
+            send_whatsapp_text(from_number, f"🧠 Anotado: {note}")
+            return True
         return False
 
     if intent == "memory_get":
         key = (routed.get("key") or "").strip()
-        if key:
-            synthetic = f"dato {key}"
-            return handle_memory(from_number, synthetic)
+        if not key:
+            key = (routed.get("text") or "").strip()
 
-        return False
+        if key:
+            answer = query_memory(key)
+            send_whatsapp_text(from_number, answer)
+            return True
+
 
     return False
 
 
 def handle_default(from_number: str, text_body: str) -> None:
-    low = text_body.lower().strip()
+    low = text_body.lower()
     if low in ("hola", "hi", "hello"):
-        send_whatsapp_text(from_number, "¡Hola! 🤖 Soy PriBot. Escribí 'ayuda' para ver comandos.")
+        send_whatsapp_text(
+            from_number,
+            "¡Hola! 🤖 Soy PriBot.\n"
+            "Puedo guardar recuerdos y crear recordatorios."
+        )
     else:
         send_whatsapp_text(from_number, f"Te leí: “{text_body}” ✅")
 
 
-# =========================
+# ==================================================
 # Routes
-# =========================
+# ==================================================
 @app.get("/")
 def health():
     return "PriBot está vivo 🤖"
@@ -171,12 +182,11 @@ def health():
 
 @app.get("/webhook")
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
+    if (
+        request.args.get("hub.mode") == "subscribe"
+        and request.args.get("hub.verify_token") == VERIFY_TOKEN
+    ):
+        return request.args.get("hub.challenge"), 200
     return "Forbidden", 403
 
 
@@ -188,49 +198,41 @@ def receive_webhook():
     try:
         value = extract_value(data)
 
-        # 0) Status updates (sent/delivered/read)
-        statuses = extract_statuses(value)
-        if statuses:
-            s = statuses[0]
-            print(f"📦 Status update: {s.get('status')} -> {s.get('recipient_id')}")
+        # 0) Status updates
+        if extract_statuses(value):
             return "OK", 200
 
-        # 1) Incoming messages
-        messages = extract_messages(value)
-        if not messages:
-            return "OK", 200
-
-        # Procesar todos por si vienen en batch
-        for msg in messages:
+        # 1) Mensajes
+        for msg in extract_messages(value):
             from_number, text_body = get_text_message_fields(msg)
             if not from_number or not text_body:
                 continue
 
-            print("📨 Incoming text from", from_number, ":", text_body)
+            print("📨 Incoming:", from_number, text_body)
 
-            # 2) Primero: comandos directos
-            if handle_reminders(from_number, text_body):
+            # 1) atajo: listar recordatorios (sin IA)
+            if text_body.lower().strip() == "mis recordatorios":
+                _, reply = list_user_reminders(from_number)
+                send_whatsapp_text(from_number, reply)
                 continue
 
-            if handle_memory(from_number, text_body):
-                continue
-
-            # 3) Luego: IA light (traduce a comandos)
+            # 2) IA decide intent y ejecuta
             if handle_ai_intents(from_number, text_body):
                 continue
 
-            # 4) Default
+            # 3) fallback
             handle_default(from_number, text_body)
 
+
     except Exception as e:
-        print("Webhook parse error:", e)
+        print("Webhook error:", e)
 
     return "OK", 200
 
 
-# =========================
+# ==================================================
 # Main
-# =========================
+# ==================================================
 if __name__ == "__main__":
     init_db()
     start_scheduler()

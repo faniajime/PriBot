@@ -11,35 +11,64 @@ model = GPT4All(MODEL_NAME)
 
 SYSTEM_PROMPT = r"""
 Sos un clasificador de intención para un bot de WhatsApp.
-Respondé con UN SOLO objeto JSON. No agregues texto extra.
+Respondé SOLO un objeto JSON válido. No agregues texto extra.
 
 Formato:
 {
-  "intent": "reminder" | "memory_set" | "memory_get" | "unknown",
+  "intent": "reminder" | "memory_store" | "memory_query" | "unknown",
   "reminder_text": "",
   "when": "",
-  "key": "",
-  "value": ""
+  "text": ""
 }
 
+"intent": "reminder" | "memory_store" | "memory_get" | "unknown"
+Nunca uses otros valores.
+
 Reglas:
-- reminder: "acuérdame", "recuérdame", "recordar", "recuerdame"
-- memory_set: "guardá", "recordá que", "mi X es Y", "recuerda X = Y"
-- memory_get: "qué es X", "cómo se llama X", "dato X"
-- Si el usuario dice “mi X se llama Y” → memory_set con key=X y value=Y
-- Si dice “recuerda que mi X es Y” → memory_set
-- Si pregunta “cómo se llama mi X” o “cuál es mi X” → memory_get con key=X
-- Si no estás seguro: "unknown"
 
-Ejemplos:
-Usuario: "Recuerda que mi perro se llama Luna"
-JSON: {"intent":"memory_set","key":"perro","value":"Luna","reminder_text":"","when":""}
+INTENT = reminder
+- El usuario quiere que le recuerden algo en el futuro
+- Palabras clave: recuerda, recuérdame, acuérdame, recordar
+Ej:
+Usuario: "Recuérdame ir a la plaza en 30 segundos"
+JSON: {
+  "intent":"reminder",
+  "reminder_text":"ir a la plaza",
+  "when":"30 segundos",
+  "text":""
+}
 
-Usuario: "Mi gata se llama Moka"
-JSON: {"intent":"memory_set","key":"gata","value":"Moka","reminder_text":"","when":""}
+INTENT = memory_store
+- El usuario está afirmando información para guardar
+- Ejemplos:
+  - "Recuerda que la abuela de memen se llama Ocha"
+  - "Mi perro se llama Luna"
+  - "James es profesor de biología"
+JSON:
+{
+  "intent":"memory_store",
+  "text":"la abuela de memen se llama Ocha",
+  "reminder_text":"",
+  "when":""
+}
 
-Usuario: "Cómo se llama mi perro?"
-JSON: {"intent":"memory_get","key":"perro","value":"","reminder_text":"","when":""}
+INTENT = memory_query
+- El usuario está preguntando algo que podría estar en memoria
+- Ejemplos:
+  - "¿Cómo se llama la abuela de memen?"
+  - "¿A qué se dedica James?"
+JSON:
+{
+  "intent":"memory_query",
+  "text":"como se llama la abuela de memen",
+  "reminder_text":"",
+  "when":""
+}
+
+INTENT = unknown
+- Si no estás seguro
+
+Respondé siempre JSON válido.
 """
 
 def _extract_object_block(text: str) -> str:
@@ -94,20 +123,21 @@ def safe_parse_to_dict(raw_text: str) -> Dict:
     return {"intent": "unknown"}
 
 def normalize_ai_fields(data: Dict) -> Dict:
-    # Arreglar keys raras como "reminder\_text"
+    if not isinstance(data, dict):
+        return {"intent": "unknown"}
+
+    # normalizar reminder_text mal escapado
     if "reminder\\_text" in data and "reminder_text" not in data:
         data["reminder_text"] = data.pop("reminder\\_text")
 
-    # Normalizar when: si viene "30 segundos" lo convertimos a "en 30 segundos"
+    # normalizar when
     when = (data.get("when") or "").strip()
-    if when:
-        # si ya empieza con "en " lo dejamos
-        if not when.lower().startswith("en "):
-            # y si parece duración corta, agregamos "en "
-            if re.search(r"^\d+\s+(segundo|segundos|minuto|minutos|hora|horas)$", when.lower()):
-                data["when"] = f"en {when}"
+    if when and not when.lower().startswith("en "):
+        if re.search(r"\d+\s+(segundo|segundos|minuto|minutos|hora|horas)", when.lower()):
+            data["when"] = f"en {when}"
 
     return data
+
 
 
 def ai_route(user_text: str) -> Dict:
